@@ -30,8 +30,8 @@ import com.amazonaws.services.s3.model.*;
 import com.amazonaws.services.s3.transfer.TransferManagerBuilder;
 import com.amazonaws.services.s3.transfer.internal.TransferManagerUtils;
 import org.apache.commons.io.input.TeeInputStream;
+import org.sonatype.nexus.blobstore.BlobIdLocationResolver;
 import org.sonatype.nexus.blobstore.BlobSupport;
-import org.sonatype.nexus.blobstore.LocationStrategy;
 import org.sonatype.nexus.blobstore.MetricsInputStream;
 import org.sonatype.nexus.blobstore.StreamMetrics;
 import org.sonatype.nexus.blobstore.api.Blob;
@@ -52,16 +52,20 @@ import com.amazonaws.services.s3.model.lifecycle.LifecycleFilterPredicate;
 import com.amazonaws.services.s3.model.lifecycle.LifecycleTagPredicate;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.LoadingCache;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.hash.HashCode;
 import org.joda.time.DateTime;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.iterable.S3Objects;
 import com.amazonaws.services.s3.transfer.TransferManager;
 
+import static java.lang.String.format;
+import static java.util.stream.StreamSupport.stream;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.cache.CacheLoader.from;
+import static org.sonatype.nexus.blobstore.DirectPathLocationStrategy.DIRECT_PATH_ROOT;
 import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.FAILED;
 import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.NEW;
 import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.STARTED;
@@ -109,6 +113,8 @@ public class S3BlobStore
 
   public static final String CONTENT_PREFIX = "content";
 
+  public static final String DIRECT_PATH_PREFIX = CONTENT_PREFIX + "/" + DIRECT_PATH_ROOT;
+
   public static final String TEMPORARY_BLOB_ID_PREFIX = "tmp$";
 
   static final Tag DELETED_TAG = new Tag("deleted", "true");
@@ -118,9 +124,7 @@ public class S3BlobStore
 
   private final AmazonS3Factory amazonS3Factory;
 
-  private final LocationStrategy permanentLocationStrategy;
-
-  private final LocationStrategy temporaryLocationStrategy;
+  private final BlobIdLocationResolver blobIdLocationResolver;
 
   private BlobStoreConfiguration blobStoreConfiguration;
 
@@ -132,13 +136,11 @@ public class S3BlobStore
 
   @Inject
   public S3BlobStore(final AmazonS3Factory amazonS3Factory,
-                     @Named("volume-chapter") final LocationStrategy permanentLocationStrategy,
-                     @Named("temporary") final LocationStrategy temporaryLocationStrategy,
+                     final BlobIdLocationResolver blobIdLocationResolver,
                      final S3BlobStoreMetricsStore storeMetrics)
   {
     this.amazonS3Factory = checkNotNull(amazonS3Factory);
-    this.permanentLocationStrategy = checkNotNull(permanentLocationStrategy);
-    this.temporaryLocationStrategy = checkNotNull(temporaryLocationStrategy);
+    this.blobIdLocationResolver = checkNotNull(blobIdLocationResolver);
     this.storeMetrics = checkNotNull(storeMetrics);
   }
 
@@ -186,10 +188,7 @@ public class S3BlobStore
    * Returns the location for a blob ID based on whether or not the blob ID is for a temporary or permanent blob.
    */
   private String getLocation(final BlobId id) {
-    if (id.asUniqueString().startsWith(TEMPORARY_BLOB_ID_PREFIX)) {
-      return CONTENT_PREFIX + "/" + temporaryLocationStrategy.location(id);
-    }
-    return CONTENT_PREFIX + "/" + permanentLocationStrategy.location(id);
+    return CONTENT_PREFIX + "/" + blobIdLocationResolver.getLocation(id);
   }
 
   @Override
@@ -223,14 +222,7 @@ public class S3BlobStore
     checkArgument(headers.containsKey(BLOB_NAME_HEADER), "Missing header: %s", BLOB_NAME_HEADER);
     checkArgument(headers.containsKey(CREATED_BY_HEADER), "Missing header: %s", CREATED_BY_HEADER);
 
-    // Generate a new blobId
-    BlobId blobId;
-    if (headers.containsKey(TEMPORARY_BLOB_HEADER)) {
-      blobId = new BlobId(TEMPORARY_BLOB_ID_PREFIX + UUID.randomUUID().toString());
-    }
-    else {
-      blobId = new BlobId(UUID.randomUUID().toString());
-    }
+    final BlobId blobId = blobIdLocationResolver.fromHeaders(headers);
 
     final String blobPath = contentPath(blobId);
     final String attributePath = attributePath(blobId);
@@ -443,12 +435,16 @@ public class S3BlobStore
       if (!s3.doesBucketExist(getConfiguredBucket())) {
         s3.createBucket(getConfiguredBucket());
 
-        addBucketLifecycleConfiguration(null);
+        if (getConfiguredExpirationInDays()>=0) {
+          addBucketLifecycleConfiguration(null);
+        }
       } else {
-        // bucket exists, we should test that the correct lifecycle config is present
-        //BucketLifecycleConfiguration lifecycleConfiguration = s3.getBucketLifecycleConfiguration(getConfiguredBucket());
-        //if (!isExpirationLifecycleConfigurationPresent(lifecycleConfiguration)) {
-          //addBucketLifecycleConfiguration(lifecycleConfiguration);
+        //if (getConfiguredExpirationInDays()>=0) {
+          // bucket exists, we should test that the correct lifecycle config is present
+         // BucketLifecycleConfiguration lifecycleConfiguration = s3.getBucketLifecycleConfiguration(getConfiguredBucket());
+          //if (!isExpirationLifecycleConfigurationPresent(lifecycleConfiguration)) {
+           // addBucketLifecycleConfiguration(lifecycleConfiguration);
+          //}
         //}
       }
 
@@ -571,6 +567,20 @@ public class S3BlobStore
   @Override
   public Stream<BlobId> getBlobIdStream() {
     Iterable<S3ObjectSummary> summaries = S3Objects.withPrefix(s3, getConfiguredBucket(), CONTENT_PREFIX);
+    return blobIdStream(summaries);
+  }
+
+  @Override
+  public Stream<BlobId> getDirectPathBlobIdStream(final String prefix) {
+    String subpath = format("%s/%s", DIRECT_PATH_PREFIX, prefix);
+    Iterable<S3ObjectSummary> summaries = S3Objects.withPrefix(s3, getConfiguredBucket(), subpath);
+    return stream(summaries.spliterator(), false)
+      .map(S3ObjectSummary::getKey)
+      .filter(key -> key.endsWith(BLOB_ATTRIBUTE_SUFFIX))
+      .map(this::attributePathToDirectPathBlobId);
+  }
+
+  private Stream<BlobId> blobIdStream(Iterable<S3ObjectSummary> summaries) {
     return StreamSupport.stream(summaries.spliterator(), false)
       .map(S3ObjectSummary::getKey)
       .map(key -> key.substring(key.lastIndexOf('/') + 1, key.length()))
@@ -589,5 +599,36 @@ public class S3BlobStore
       log.error("Unable to load S3BlobAttributes for blob id: {}", blobId, e);
       return null;
     }
+  }
+
+  @Override
+  public void setBlobAttributes(BlobId blobId, BlobAttributes blobAttributes) {
+    try {
+      S3BlobAttributes s3BlobAttributes = (S3BlobAttributes) getBlobAttributes(blobId);
+      s3BlobAttributes.updateFrom(blobAttributes);
+      s3BlobAttributes.store();
+    }
+    catch (Exception e) {
+      log.error("Unable to set BlobAttributes for blob id: {}, exception: {}",
+          blobId, e.getMessage(), log.isDebugEnabled() ? e : null);
+    }
+  }
+
+  /**
+   * Used by {@link #getDirectPathBlobIdStream(String)} to convert an s3 key to a {@link BlobId}.
+   *
+   * @see BlobIdLocationResolver
+   */
+  private BlobId attributePathToDirectPathBlobId(final String s3Key) {
+    checkArgument(s3Key.startsWith(DIRECT_PATH_PREFIX + "/"), "Not direct path blob path: %s", s3Key);
+    checkArgument(s3Key.endsWith(BLOB_ATTRIBUTE_SUFFIX), "Not blob attribute path: %s", s3Key);
+    String blobName = s3Key
+        .substring(0, s3Key.length() - BLOB_ATTRIBUTE_SUFFIX.length())
+        .substring(DIRECT_PATH_PREFIX.length() + 1);
+    Map<String, String> headers = ImmutableMap.of(
+        BLOB_NAME_HEADER, blobName,
+        DIRECT_PATH_BLOB_HEADER, "true"
+    );
+    return blobIdLocationResolver.fromHeaders(headers);
   }
 }
