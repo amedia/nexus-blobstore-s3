@@ -436,7 +436,7 @@ public class S3BlobStore
         s3.createBucket(getConfiguredBucket());
 
         if (getConfiguredExpirationInDays()>=0) {
-          addBucketLifecycleConfiguration(null);
+          //addBucketLifecycleConfiguration(null);
         }
       } else {
         //if (getConfiguredExpirationInDays()>=0) {
