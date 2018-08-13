@@ -433,10 +433,10 @@ public class S3BlobStore
     try {
       this.s3 = amazonS3Factory.create(configuration);
       if (!s3.doesBucketExist(getConfiguredBucket())) {
-        s3.createBucket(getConfiguredBucket());
+        //s3.createBucket(getConfiguredBucket());
 
         if (getConfiguredExpirationInDays()>=0) {
-          //addBucketLifecycleConfiguration(null);
+          addBucketLifecycleConfiguration(null);
         }
       } else {
         //if (getConfiguredExpirationInDays()>=0) {
